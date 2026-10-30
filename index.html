@@ -35,7 +35,8 @@
     position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
     gap: 12px; background: rgba(7, 10, 16, .84); text-align: center; padding: 16px;
   }
-  #overlay[hidden] { display: none; }
+  #overlay { transition: opacity .28s ease, visibility .28s ease; }
+  #overlay.off { opacity: 0; visibility: hidden; }
   #overlay h1 { margin: 0; font: 800 34px system-ui, sans-serif; letter-spacing: .14em; }
   #overlay .sub { margin: 0; color: var(--muted); font-size: 14px; }
   #overlay .big { font: 700 24px ui-monospace, Menlo, Consolas, monospace; }
@@ -114,9 +115,15 @@
 (() => {
   'use strict';
 
-  // ---------- constants ----------
+  // ---------- tuning ----------
   const COLS = 10, ROWS = 20, HIDDEN = 2, H = ROWS + HIDDEN;
-  const DAS = 160, ARR = 45, SOFT_MAX = 40, LOCK_DELAY = 500, MAX_RESETS = 15, CLEAR_TIME = 200;
+  const STEP = 1000 / 120;          // fixed logic tick (ms)
+  const DAS = 170, ARR = 55;        // auto-shift delay / repeat (ms)
+  const SOFT_MS = 90;               // soft drop: ms per row (just faster, never instant)
+  const HARD_MS = 14;               // hard drop: ms per row (a quick, visible slam)
+  const LOCK_DELAY = 500, MAX_RESETS = 15;
+  const CLEAR_FADE = 260;           // cleared rows shrink away (ms)
+  const EASE_X = 32, EASE_Y = 34, EASE_ROT = 26, EASE_COLLAPSE = 14, EASE_UI = 14; // per second
   const LINE_SCORE = [0, 100, 300, 500, 800];
   const COLORS = { I: '#38d6f5', J: '#3d7bff', L: '#ff9a2e', O: '#ffd23f', S: '#4fdc6a', T: '#b56bff', Z: '#ff4d6a' };
   const SHAPES = {
@@ -147,6 +154,7 @@
     '2>3': [[0,0],[2,0],[-1,0],[2,1],[-1,-2]],   '3>2': [[0,0],[-2,0],[1,0],[-2,-1],[1,2]],
     '3>0': [[0,0],[1,0],[-2,0],[1,-2],[-2,1]],   '0>3': [[0,0],[-1,0],[2,0],[-1,2],[2,-1]],
   };
+  const ease = (k, dt) => 1 - Math.exp(-k * dt / 1000);
 
   // ---------- DOM ----------
   const $ = (id) => document.getElementById(id);
@@ -162,9 +170,13 @@
   function saveBest(v) { try { localStorage.setItem(BEST_KEY, String(v)); } catch (e) {} }
 
   // ---------- state ----------
-  let board, piece, queue, bag, holdType, holdUsed, score, lines, level, best = loadBest();
+  let board = null, piece = null, queue = [], bag = [], holdType = null, holdUsed = false;
+  let score = 0, lines = 0, level = 1, best = loadBest();
   let state = 'title'; // title | play | paused | over
-  let fallAcc, lockTimer, lockResets, lowestY, clearing;
+  let fall = 0, lockTimer = 0, lockResets = 0, lowestY = 0, clearing = null;
+  let rowOff = new Array(H).fill(0);   // visual offset (rows) while the stack collapses
+  let flashes = [];                    // brief glow on freshly locked cells
+  let nextShift = 0, holdFade = 1, shownScore = 0, overFade = 0;
   const held = { left: false, right: false, soft: false };
   let dir = 0, dasTimer = 0, arrTimer = 0;
 
@@ -174,12 +186,9 @@
     for (let i = b.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [b[i], b[j]] = [b[j], b[i]]; }
     return b;
   }
-  function nextType() {
-    while (queue.length < 6) { if (!bag.length) bag = refillBag(); queue.push(bag.pop()); }
-    const t = queue.shift();
-    while (queue.length < 6) { if (!bag.length) bag = refillBag(); queue.push(bag.pop()); }
-    return t;
-  }
+  function fillQueue() { while (queue.length < 6) { if (!bag.length) bag = refillBag(); queue.push(bag.pop()); } }
+  function nextType() { fillQueue(); const t = queue.shift(); fillQueue(); nextShift = 1; return t; }
+
   function collide(t, r, x, y) {
     const m = ROT[t][r];
     for (let i = 0; i < m.length; i++) for (let j = 0; j < m.length; j++) {
@@ -190,25 +199,29 @@
     }
     return false;
   }
-  function cells(p) {
-    const out = [], m = ROT[p.t][p.r];
-    for (let i = 0; i < m.length; i++) for (let j = 0; j < m.length; j++) if (m[i][j]) out.push([p.x + j, p.y + i]);
+  function cells(t, r, x, y) {
+    const out = [], m = ROT[t][r];
+    for (let i = 0; i < m.length; i++) for (let j = 0; j < m.length; j++) if (m[i][j]) out.push([x + j, y + i]);
     return out;
   }
   const grounded = () => collide(piece.t, piece.r, piece.x, piece.y + 1);
+  const settled = () => Math.abs(piece.rx - piece.x) < 0.03 && Math.abs(piece.ry - piece.y) < 0.03 && Math.abs(piece.ang) < 0.03;
 
   function spawn(t) {
-    piece = { t, r: 0, x: t === 'O' ? 4 : 3, y: 0 };
-    if (collide(t, 0, piece.x, piece.y)) return gameOver();
-    if (!collide(t, 0, piece.x, piece.y + 1)) piece.y++;
-    fallAcc = 0; lockTimer = 0; lockResets = 0; lowestY = piece.y;
+    const x = t === 'O' ? 4 : 3;
+    piece = { t, r: 0, x, y: 0, rx: x, ry: -1.2, ang: 0, alpha: 0, dropping: false };
+    if (collide(t, 0, x, 0)) { piece = null; return gameOver(); }
+    if (!collide(t, 0, x, 1)) piece.y = 1;
+    fall = 0; lockTimer = 0; lockResets = 0; lowestY = piece.y;
   }
 
   function startGame() {
-    board = newBoard(); queue = []; bag = [];
+    board = newBoard(); queue = []; bag = []; rowOff.fill(0); flashes = [];
     holdType = null; holdUsed = false; score = 0; lines = 0; level = 1; clearing = null;
-    dir = 0; held.left = held.right = held.soft = false;
+    shownScore = 0; overFade = 0;
+    dir = 0;
     spawn(nextType());
+    nextShift = 0;
     state = 'play';
     hideOverlay();
     updateUI();
@@ -216,10 +229,10 @@
 
   function gameOver() {
     state = 'over';
-    piece = null;
-    if (score > best) { best = score; saveBest(best); }
+    const isBest = score > best;
+    if (isBest) { best = score; saveBest(best); }
     updateUI();
-    showOverlay('GAME OVER', 'Score ' + score.toLocaleString() + (score >= best && score > 0 ? ' · new best!' : ''), 'Play again');
+    showOverlay('GAME OVER', 'Score ' + score.toLocaleString() + (isBest ? ' · new best!' : ''), 'Play again');
   }
 
   function onMoved() {
@@ -233,52 +246,62 @@
     return true;
   }
   function rotate(d) {
-    if (!piece || piece.t === 'O') return;
+    if (!piece || piece.dropping || piece.t === 'O') return;
     const from = piece.r, to = (from + d + 4) % 4;
     const table = (piece.t === 'I' ? KICKS_I : KICKS)[from + '>' + to];
     for (const [kx, ky] of table) {
       if (!collide(piece.t, to, piece.x + kx, piece.y - ky)) {
         piece.x += kx; piece.y -= ky; piece.r = to;
+        // draw the new orientation turned back, then let it swing into place
+        piece.ang = Math.max(-Math.PI, Math.min(Math.PI, piece.ang - d * Math.PI / 2));
+        if (!grounded() && piece.ry > piece.y) fall = 0;
         onMoved();
         return;
       }
     }
   }
   function hardDrop() {
-    if (!piece) return;
-    let d = 0;
-    while (!collide(piece.t, piece.r, piece.x, piece.y + 1)) { piece.y++; d++; }
-    score += d * 2;
-    lock();
+    if (!piece || piece.dropping) return;
+    piece.dropping = true;
+    dir = 0;
   }
   function hold() {
-    if (!piece || holdUsed) return;
+    if (!piece || holdUsed || piece.dropping) return;
     const cur = piece.t;
     if (holdType) spawn(holdType); else spawn(nextType());
-    holdType = cur; holdUsed = true;
+    holdType = cur; holdUsed = true; holdFade = 0;
   }
 
   function lock() {
     let above = true;
-    for (const [x, y] of cells(piece)) {
+    const placed = cells(piece.t, piece.r, piece.x, piece.y);
+    for (const [x, y] of placed) {
       if (y >= 0) board[y][x] = piece.t;
       if (y >= HIDDEN) above = false;
     }
+    flashes.push({ cells: placed, t: 0 });
     piece = null;
     holdUsed = false;
     if (above) return gameOver();
     const full = [];
     for (let y = 0; y < H; y++) if (board[y].every(Boolean)) full.push(y);
-    if (full.length) {
-      clearing = { rows: full, t: 0 };
-    } else {
-      spawn(nextType());
-    }
+    if (full.length) clearing = { rows: full, t: 0 };
+    else spawn(nextType());
     updateUI();
   }
-  function finishClear() {
-    const n = clearing.rows.length;
-    for (const y of clearing.rows) { board.splice(y, 1); board.unshift(Array(COLS).fill(null)); }
+
+  function collapse() {
+    const rows = clearing.rows, n = rows.length;
+    const keep = [], offs = [];
+    for (let y = 0; y < H; y++) {
+      if (rows.includes(y)) continue;
+      keep.push(board[y]);
+      offs.push(rowOff[y] + rows.filter((r) => r > y).length);
+    }
+    board = []; const newOff = [];
+    for (let i = 0; i < n; i++) { board.push(Array(COLS).fill(null)); newOff.push(0); }
+    board.push(...keep); newOff.push(...offs);
+    rowOff = newOff;
     clearing = null;
     score += LINE_SCORE[n] * level;
     lines += n;
@@ -287,17 +310,34 @@
     updateUI();
   }
 
-  const gravityMs = () => Math.pow(Math.max(0.8 - (Math.min(level, 20) - 1) * 0.007, 0.01), Math.min(level, 20) - 1) * 1000;
+  const gravityMs = () => {
+    const l = Math.min(level, 20);
+    return Math.pow(Math.max(0.8 - (l - 1) * 0.007, 0.01), l - 1) * 1000;
+  };
 
-  // ---------- loop ----------
+  // ---------- fixed-step logic ----------
   function update(dt) {
     if (state !== 'play') return;
     if (clearing) {
       clearing.t += dt;
-      if (clearing.t >= CLEAR_TIME) finishClear();
+      if (clearing.t >= CLEAR_FADE) collapse();
       return;
     }
     if (!piece) return;
+
+    if (piece.dropping) {
+      if (!grounded()) {
+        fall += dt / HARD_MS;
+        while (fall >= 1) {
+          if (collide(piece.t, piece.r, piece.x, piece.y + 1)) { fall = 0; break; }
+          piece.y++; fall -= 1; score += 2;
+        }
+      } else {
+        fall = 0;
+        if (settled()) lock();
+      }
+      return;
+    }
 
     // auto-shift
     if (dir) {
@@ -308,51 +348,62 @@
       }
     }
 
-    // gravity / soft drop
-    const g = gravityMs();
-    const interval = held.soft ? Math.min(g, SOFT_MAX) : g;
-    fallAcc += dt;
-    while (fallAcc >= interval) {
-      fallAcc -= interval;
-      if (tryMove(0, 1)) { if (held.soft) score++; }
-      else { fallAcc = 0; break; }
-    }
-
-    // lock delay
     if (grounded()) {
+      fall = 0;
       lockTimer += dt;
-      if (lockTimer >= LOCK_DELAY) lock();
+      if (lockTimer >= LOCK_DELAY && settled()) lock();
     } else {
       lockTimer = 0;
+      const g = gravityMs();
+      fall += dt / (held.soft ? Math.min(g, SOFT_MS) : g);
+      while (fall >= 1) {
+        if (collide(piece.t, piece.r, piece.x, piece.y + 1)) { fall = 0; break; }
+        piece.y++; fall -= 1;
+        onMoved();
+        if (held.soft) score++;
+      }
     }
-    updateScore();
   }
 
-  let last = performance.now();
-  function frame(now) {
-    const dt = Math.min(now - last, 100);
-    last = now;
-    update(dt);
-    draw();
-    requestAnimationFrame(frame);
+  // ---------- per-frame visuals ----------
+  function animate(dt) {
+    if (piece) {
+      const ty = piece.y + (piece.dropping || !grounded() ? fall : 0);
+      piece.rx += (piece.x - piece.rx) * ease(EASE_X, dt);
+      piece.ry += (ty - piece.ry) * ease(piece.dropping ? EASE_Y * 1.6 : EASE_Y, dt);
+      piece.ang *= 1 - ease(EASE_ROT, dt);
+      if (Math.abs(piece.ang) < 0.002) piece.ang = 0;
+      piece.alpha += (1 - piece.alpha) * ease(18, dt);
+    }
+    const kc = ease(EASE_COLLAPSE, dt);
+    for (let y = 0; y < H; y++) if (rowOff[y]) { rowOff[y] -= rowOff[y] * kc + 0.0006 * dt; if (rowOff[y] < 0.004) rowOff[y] = 0; }
+    for (const f of flashes) f.t += dt;
+    flashes = flashes.filter((f) => f.t < 220);
+    nextShift *= 1 - ease(16, dt); if (nextShift < 0.002) nextShift = 0;
+    holdFade += (1 - holdFade) * ease(12, dt);
+    shownScore += (score - shownScore) * ease(EASE_UI, dt);
+    if (Math.abs(score - shownScore) < 0.5) shownScore = score;
+    ui.score.textContent = Math.round(shownScore).toLocaleString();
+    overFade += ((state === 'over' ? 1 : 0) - overFade) * ease(4, dt);
   }
 
   // ---------- drawing ----------
   let cell = 30, pcell = 20, dpr = 1;
 
   function block(ctx, x, y, s, color) {
-    const g = Math.max(1, Math.round(s * 0.06));
+    const g = Math.max(1, s * 0.06);
+    const sh = Math.max(1, s * 0.15);
     ctx.fillStyle = color;
     ctx.fillRect(x + g, y + g, s - 2 * g, s - 2 * g);
     ctx.fillStyle = 'rgba(255,255,255,.22)';
-    ctx.fillRect(x + g, y + g, s - 2 * g, Math.max(1, s * 0.16));
+    ctx.fillRect(x + g, y + g, s - 2 * g, sh);
     ctx.fillStyle = 'rgba(0,0,0,.22)';
-    ctx.fillRect(x + g, y + s - g - Math.max(1, s * 0.14), s - 2 * g, Math.max(1, s * 0.14));
+    ctx.fillRect(x + g, y + s - g - sh, s - 2 * g, sh);
   }
   function ghostBlock(ctx, x, y, s, color) {
-    const g = Math.max(1, Math.round(s * 0.06));
-    ctx.globalAlpha = 0.14; ctx.fillStyle = color; ctx.fillRect(x + g, y + g, s - 2 * g, s - 2 * g);
-    ctx.globalAlpha = 0.6; ctx.strokeStyle = color; ctx.lineWidth = Math.max(1, s * 0.06);
+    const g = Math.max(1, s * 0.06);
+    ctx.globalAlpha = 0.13; ctx.fillStyle = color; ctx.fillRect(x + g, y + g, s - 2 * g, s - 2 * g);
+    ctx.globalAlpha = 0.55; ctx.strokeStyle = color; ctx.lineWidth = Math.max(1, s * 0.06);
     ctx.strokeRect(x + g + 0.5, y + g + 0.5, s - 2 * g - 1, s - 2 * g - 1);
     ctx.globalAlpha = 1;
   }
@@ -362,7 +413,6 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#070a10';
     ctx.fillRect(0, 0, COLS * s, ROWS * s);
-    // grid
     ctx.strokeStyle = 'rgba(255,255,255,.04)'; ctx.lineWidth = 1;
     ctx.beginPath();
     for (let x = 1; x < COLS; x++) { ctx.moveTo(x * s + 0.5, 0); ctx.lineTo(x * s + 0.5, ROWS * s); }
@@ -370,44 +420,96 @@
     ctx.stroke();
 
     if (board) {
-      for (let y = HIDDEN; y < H; y++) for (let x = 0; x < COLS; x++) {
-        const t = board[y][x];
-        if (t) block(ctx, x * s, (y - HIDDEN) * s, s, COLORS[t]);
+      // settled stack (rows glide down after a clear; cleared rows shrink away)
+      const p = clearing ? Math.min(1, clearing.t / CLEAR_FADE) : 0;
+      for (let y = 0; y < H; y++) {
+        const sy = (y - HIDDEN - rowOff[y]) * s;
+        if (sy <= -s) continue;
+        const isClear = clearing && clearing.rows.includes(y);
+        for (let x = 0; x < COLS; x++) {
+          const t = board[y][x];
+          if (!t) continue;
+          if (isClear) {
+            const k = 1 - p * p;
+            const ss = s * k, off = (s - ss) / 2;
+            ctx.globalAlpha = Math.max(0, k);
+            block(ctx, x * s + off, sy + off, ss, COLORS[t]);
+            ctx.fillStyle = 'rgba(255,255,255,' + (0.6 * (1 - p)).toFixed(3) + ')';
+            ctx.fillRect(x * s + off, sy + off, ss, ss);
+            ctx.globalAlpha = 1;
+          } else {
+            block(ctx, x * s, sy, s, COLORS[t]);
+          }
+        }
       }
-      if (clearing) {
-        const a = 1 - clearing.t / CLEAR_TIME;
-        ctx.fillStyle = 'rgba(255,255,255,' + (0.85 * a).toFixed(3) + ')';
-        for (const y of clearing.rows) ctx.fillRect(0, (y - HIDDEN) * s, COLS * s, s);
+      for (const f of flashes) {
+        const a = 0.45 * (1 - f.t / 220);
+        ctx.fillStyle = 'rgba(255,255,255,' + a.toFixed(3) + ')';
+        for (const [x, y] of f.cells) if (y >= HIDDEN) ctx.fillRect(x * s + 1, (y - HIDDEN - rowOff[y]) * s + 1, s - 2, s - 2);
       }
-      if (piece && state !== 'over') {
-        let gy = piece.y;
-        while (!collide(piece.t, piece.r, piece.x, gy + 1)) gy++;
-        if (gy !== piece.y) for (const [x, y] of cells({ ...piece, y: gy })) if (y >= HIDDEN) ghostBlock(ctx, x * s, (y - HIDDEN) * s, s, COLORS[piece.t]);
-        for (const [x, y] of cells(piece)) if (y >= HIDDEN) block(ctx, x * s, (y - HIDDEN) * s, s, COLORS[piece.t]);
+
+      if (piece) {
+        const color = COLORS[piece.t];
+        // ghost
+        if (!piece.dropping) {
+          let gy = piece.y;
+          while (!collide(piece.t, piece.r, piece.x, gy + 1)) gy++;
+          if (gy - piece.ry > 0.6) {
+            ctx.globalAlpha = Math.min(1, gy - piece.ry - 0.6) * piece.alpha;
+            const m = ROT[piece.t][piece.r];
+            for (let i = 0; i < m.length; i++) for (let j = 0; j < m.length; j++) {
+              if (m[i][j] && gy + i >= HIDDEN) ghostBlock(ctx, (piece.rx + j) * s, (gy + i - HIDDEN) * s, s, color);
+            }
+            ctx.globalAlpha = 1;
+          }
+        }
+        // active piece, drawn around its rotation centre
+        const m = ROT[piece.t][piece.r], n = m.length;
+        ctx.save();
+        ctx.translate((piece.rx + n / 2) * s, (piece.ry - HIDDEN + n / 2) * s);
+        ctx.rotate(piece.ang);
+        ctx.globalAlpha = piece.alpha;
+        for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) if (m[i][j]) block(ctx, (j - n / 2) * s, (i - n / 2) * s, s, color);
+        ctx.restore();
+      }
+      if (overFade > 0.001) {
+        ctx.fillStyle = 'rgba(7,10,16,' + (0.55 * overFade).toFixed(3) + ')';
+        ctx.fillRect(0, 0, COLS * s, ROWS * s);
       }
     }
-    drawPreview(hctx, holdC, holdType ? [holdType] : [], holdUsed);
-    drawPreview(nctx, nextC, queue ? queue.slice(0, 3) : [], false);
+    drawHold();
+    drawNext();
   }
 
-  function drawPreview(ctx, canvas, types, dim) {
-    const w = canvas.width / dpr, h = canvas.height / dpr;
+  function drawShape(ctx, t, cx, cy, s, alpha) {
+    const m = SHAPES[t];
+    let minX = 9, maxX = -1, minY = 9, maxY = -1;
+    for (let i = 0; i < m.length; i++) for (let j = 0; j < m.length; j++) if (m[i][j]) {
+      minX = Math.min(minX, j); maxX = Math.max(maxX, j); minY = Math.min(minY, i); maxY = Math.max(maxY, i);
+    }
+    const ox = cx - ((maxX - minX + 1) * s) / 2 - minX * s;
+    const oy = cy - ((maxY - minY + 1) * s) / 2 - minY * s;
+    ctx.globalAlpha = alpha;
+    for (let i = 0; i < m.length; i++) for (let j = 0; j < m.length; j++) if (m[i][j]) block(ctx, ox + j * s, oy + i * s, s, COLORS[t]);
+    ctx.globalAlpha = 1;
+  }
+  function drawHold() {
+    const ctx = hctx, w = holdC.width / dpr, h = holdC.height / dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
-    const slot = h / Math.max(1, canvas === nextC ? 3 : 1);
-    types.forEach((t, k) => {
-      const m = SHAPES[t];
-      let minX = 9, maxX = -1, minY = 9, maxY = -1;
-      for (let i = 0; i < m.length; i++) for (let j = 0; j < m.length; j++) if (m[i][j]) {
-        minX = Math.min(minX, j); maxX = Math.max(maxX, j); minY = Math.min(minY, i); maxY = Math.max(maxY, i);
-      }
-      const s = pcell;
-      const ox = (w - (maxX - minX + 1) * s) / 2 - minX * s;
-      const oy = k * slot + (slot - (maxY - minY + 1) * s) / 2 - minY * s;
-      ctx.globalAlpha = dim ? 0.35 : 1;
-      for (let i = 0; i < m.length; i++) for (let j = 0; j < m.length; j++) if (m[i][j]) block(ctx, ox + j * s, oy + i * s, s, COLORS[t]);
-      ctx.globalAlpha = 1;
-    });
+    if (holdType) drawShape(ctx, holdType, w / 2, h / 2, pcell, (holdUsed ? 0.35 : 1) * holdFade);
+  }
+  function drawNext() {
+    const ctx = nctx, w = nextC.width / dpr, h = nextC.height / dpr, slot = h / 3;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    if (!board) return;
+    for (let k = 0; k < 4 && k < queue.length; k++) {
+      const cy = (k + nextShift + 0.5) * slot;
+      if (cy - slot / 2 > h) continue;
+      const a = k === 3 ? 1 - Math.min(1, (cy - h + slot / 2) / slot) : 1;
+      drawShape(ctx, queue[k], w / 2, cy, pcell, Math.max(0, Math.min(1, a)));
+    }
   }
 
   function sizeCanvas(c, w, h) {
@@ -430,34 +532,42 @@
     draw();
   }
 
-  // ---------- UI ----------
-  let shownScore = -1;
-  function updateScore() {
-    if (score !== shownScore) { shownScore = score; ui.score.textContent = score.toLocaleString(); }
+  // ---------- main loop: fixed logic steps, render every display frame ----------
+  let last = performance.now(), acc = 0;
+  function frame(now) {
+    const dt = Math.min(now - last, 100);
+    last = now;
+    acc += dt;
+    while (acc >= STEP) { update(STEP); acc -= STEP; }
+    animate(dt);
+    draw();
+    requestAnimationFrame(frame);
   }
+
+  // ---------- UI ----------
   function updateUI() {
-    updateScore();
     ui.level.textContent = level;
     ui.lines.textContent = lines;
-    ui.best.textContent = Math.max(best, state === 'over' ? 0 : score).toLocaleString();
+    ui.best.textContent = Math.max(best, score).toLocaleString();
   }
   function showOverlay(title, sub, btn) {
     ovTitle.textContent = title; ovSub.textContent = sub; ovBtn.textContent = btn;
-    overlay.hidden = false;
+    overlay.classList.remove('off');
     ovBtn.focus({ preventScroll: true });
   }
-  function hideOverlay() { overlay.hidden = true; boardC.focus && boardC.focus(); }
+  function hideOverlay() { overlay.classList.add('off'); ovBtn.blur(); }
 
+  function clearHeld() { dir = 0; held.left = held.right = held.soft = false; }
   function pause() {
     if (state !== 'play') return;
     state = 'paused';
-    dir = 0; held.left = held.right = held.soft = false;
+    clearHeld();
     showOverlay('PAUSED', 'Take a breather.', 'Resume');
   }
   function resume() {
     if (state !== 'paused') return;
     state = 'play';
-    last = performance.now();
+    last = performance.now(); acc = 0;
     hideOverlay();
   }
   function primaryAction() {
@@ -469,18 +579,14 @@
   // ---------- input ----------
   function press(act) {
     if (act === 'pause') { if (state === 'play') pause(); else if (state === 'paused') resume(); return; }
-    if (state !== 'play' || clearing) {
-      if (act === 'left' || act === 'right' || act === 'soft') held[act] = true;
-      return;
-    }
+    if (act === 'left' || act === 'right' || act === 'soft') held[act] = true;
+    if (state !== 'play' || clearing || !piece) return;
     switch (act) {
-      case 'left': case 'right': {
-        held[act] = true;
+      case 'left': case 'right':
+        if (piece.dropping) break;
         dir = act === 'left' ? -1 : 1; dasTimer = 0; arrTimer = 0;
         tryMove(dir, 0);
         break;
-      }
-      case 'soft': held.soft = true; fallAcc = Math.max(fallAcc, SOFT_MAX); break;
       case 'hard': hardDrop(); break;
       case 'cw': rotate(1); break;
       case 'ccw': rotate(-1); break;
@@ -516,7 +622,7 @@
     const act = KEYMAP[e.code];
     if (act) release(act);
   });
-  window.addEventListener('blur', () => { dir = 0; held.left = held.right = held.soft = false; pause(); });
+  window.addEventListener('blur', () => { clearHeld(); pause(); });
   document.addEventListener('visibilitychange', () => { if (document.hidden) pause(); });
 
   for (const btn of controls.querySelectorAll('button')) {
@@ -525,7 +631,7 @@
     const up = () => { if (!down) return; down = false; btn.classList.remove('down'); release(act); };
     btn.addEventListener('pointerdown', (e) => {
       e.preventDefault();
-      btn.setPointerCapture && btn.setPointerCapture(e.pointerId);
+      if (btn.setPointerCapture) btn.setPointerCapture(e.pointerId);
       down = true; btn.classList.add('down');
       if (act === 'pause' && state !== 'play' && state !== 'paused') { primaryAction(); return; }
       press(act);
@@ -537,8 +643,7 @@
   }
 
   window.addEventListener('resize', layout);
-  updateUIInit();
-  function updateUIInit() { score = 0; lines = 0; level = 1; updateUI(); }
+  updateUI();
   layout();
   requestAnimationFrame(frame);
 })();
